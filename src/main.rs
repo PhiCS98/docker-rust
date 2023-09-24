@@ -22,9 +22,6 @@ fn main() -> Result<()> {
     std::io::stderr().write_all(&output.stderr).unwrap();
     if output.status.success() {
         std::io::stdout().write_all(&output.stdout)?;
-    } else {
-        std::process::exit(1);
     }
-
-    Ok(())
+    std::process::exit(output.status.code().unwrap_or(1))
 }
