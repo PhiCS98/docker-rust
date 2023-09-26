@@ -38,6 +38,13 @@ fn main() -> Result<()> {
     program_path.push("/");
     program_path.push(program_name);
 
+
+    let libc_unshare_result = unsafe { libc::unshare(libc::CLONE_NEWPID) };
+
+    if libc_unshare_result != 0 {
+        std::process::exit(libc_unshare_result);
+    }
+
     let output = std::process::Command::new(program_path)
         .args(command_args)
         .stdout(std::process::Stdio::inherit())
