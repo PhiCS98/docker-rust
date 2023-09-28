@@ -1,54 +1,60 @@
 use anyhow::{Context, Result};
+use docker_starter_rust::DOCKER;
+use flate2::read::GzDecoder;
 use std::{
-    os::unix::prelude::OsStrExt,
-    path::{Path, PathBuf},
+    fs,
+    io::{Seek, SeekFrom},
+    path::{self}, process::Stdio,
 };
-use tempfile::TempDir;
+use tar::Archive;
 
 // Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    let image = &args[2];
     let command = &args[3];
     let command_args = &args[4..];
-
-    let command_path = Path::new(command);
-    let program_name = command_path.file_name().unwrap();
-    let execution_dir = TempDir::new()?;
-    let mut tmp_command = PathBuf::new();
-
-    tmp_command.push(execution_dir.path());
-    tmp_command.push(program_name);
-    let tmp_command = tmp_command.as_path();
-
-    std::fs::copy(command_path, tmp_command)?;
-
-    let c_path = std::ffi::CString::new(execution_dir.path().as_os_str().as_bytes())?;
-    let chroot = unsafe { libc::chroot(c_path.as_ptr()) };
-
-    if chroot != 0 {
-        std::process::exit(chroot);
+    let image: Vec<&str> = image.split(':').collect();
+    let image_name = image[0];
+    let image_reference = if image.len() == 2 { image[1] } else { "latest" };
+    // Create temporary directory
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path();
+    // Copy the binary
+    let target_command = temp_path.join(
+        path::Path::new(&command)
+            .to_str()
+            .unwrap()
+            .trim_start_matches('/'),
+    );
+    fs::create_dir_all(target_command.parent().unwrap())?;
+    fs::copy(command, &target_command)?;
+    // Create empty /dev/null
+    let devnull_path = temp_dir.path().join("dev/null");
+    fs::create_dir_all(devnull_path.parent().unwrap())?;
+    fs::File::create(devnull_path)?;
+    // Copy layers
+    let manifest = DOCKER::get_manifest(image_name, image_reference)?;
+    for layer in manifest.layers.iter() {
+        let mut file = DOCKER::get_layer(image_name, layer)?;
+        file.seek(SeekFrom::Start(0))?;
+        let tar = GzDecoder::new(file);
+        let mut archive = Archive::new(tar);
+        archive.unpack(temp_path)?;
     }
-    // Set the directory as root to avoid problems with the chroot change
+    // chroot into the temp dir
+    std::os::unix::fs::chroot(temp_path)?;
     std::env::set_current_dir("/")?;
-    // Create /dev/null as is expected on the container
-    std::fs::create_dir_all("/dev")?;
-    std::fs::File::create("/dev/null")?;
-
-    let mut program_path = PathBuf::new();
-    program_path.push("/");
-    program_path.push(program_name);
-
-
-    let libc_unshare_result = unsafe { libc::unshare(libc::CLONE_NEWPID) };
-
-    if libc_unshare_result != 0 {
-        std::process::exit(libc_unshare_result);
-    }
-
-    let output = std::process::Command::new(program_path)
+    // Unshare to create a new process namespace
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWPID) != 0 {
+            panic!("Failed to unshare: {}", std::io::Error::last_os_error());
+        }
+    };
+    let output = std::process::Command::new(command)
         .args(command_args)
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .output()
         .with_context(|| {
             format!(
@@ -56,12 +62,5 @@ fn main() -> Result<()> {
                 command, command_args
             )
         })?;
-
-    if output.status.success() {
-        let _std_out = std::str::from_utf8(&output.stdout)?;
-        //println!("{}", std_out);
-    } else {
-        std::process::exit(output.status.code().unwrap_or(1));
-    }
-    Ok(())
+    std::process::exit(output.status.code().unwrap_or(1));
 }
